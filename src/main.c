@@ -2,21 +2,48 @@
  *--------------------------------------
  * Program Name: FISHY
  *       Author: Rodger "Iambian" Weisman
- *      License: BSD (See LICENSE file)
+ *      License: MIT (See LICENSE file)
  *  Description: Eat the bigger fish and don't get eaten
  *--------------------------------------
 */
 
-#define VERSION_INFO "v0.2"
+#define VERSION_INFO "v0.3"
 
+#define CUSTOM_PALETTE
+#ifndef CUSTOM_PALETTE
+//If not using custom palette, use XLIBC defaults.
 #define TRANSPARENT_COLOR 0xF8
 #define GREETINGS_DIALOG_TEXT_COLOR 0xDF
+#define DARK_BLUE_COLOR 0x08
+#define TITLE_TEXT_COLOR 0xEF
+#define SCORE_TEXT_COLOR 0xFE
+#define BACKGROUND_COLOR 0x12
+#else
+//Custom palette entry offsets. Use mappings in convimg.yaml to set these.
+#define TRANSPARENT_COLOR 0
+#define GREETINGS_DIALOG_TEXT_COLOR 1
+#define DARK_BLUE_COLOR 2
+#define TITLE_TEXT_COLOR 3
+#define SCORE_TEXT_COLOR 4
+#define BACKGROUND_COLOR 5
+#endif
+
+
+#define LCD_WIDTH 320
+#define LCD_HEIGHT 240
+
 #define BULLET_TABLE_SIZE 512
 #define ENEMY_TABLE_SIZE 32
 #define MAX_ENEMY_SIZE 13
 #define MAX_PLAYER_SIZE 15
 #define MIN_FISH_TNL 2
 #define FISH_LEVEL_UP_FACTOR 2
+#define DRAG_COEFFICIENT 6
+#define MOVE_FACTOR 14
+
+#define FISHTANK_SIZE 24576  //Measured usage is 23669 bytes with current assets.
+#define PLAYERFISH_GAMEPLAY_BUFFER_SIZE ((160*120)+2)
+#define PLAYERFISH_VICTORY_BUFFER_SIZE ((240*180)+2)
 
 #define GM_TITLE 0
 #define GM_OPENANIM 1
@@ -36,23 +63,32 @@
 
 #define ACCELFACTOR ((int)(0.07*256))
 
+/* Keep these headers */
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <tice.h>
+
 /* Standard headers (recommended) */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/rtc.h>
+#include <assert.h>
+
 
 /* External library headers */
 #include <debug.h>
 #include <intce.h>
 #include <keypadc.h>
 #include <graphx.h>
-#include <decompress.h>
+#include <compression.h>
 #include <fileioc.h>
 
 #include "gfx/sprites_gfx.h"
 
-
+#define DBG_KEYCOMBO (kb_2nd | kb_Left | kb_Right)
 
 typedef union fp16_8 {
 	int fp;
@@ -107,14 +143,18 @@ void drawbgempty();
 void doplayer();
 void doenemies();
 //---
-void putaway();
 void waitanykey();
 void keywait();
 void drawdebug();
-void centerxtext(char* strobj,int y);
+void printtext(const char* strobj);
+void centerxtext(const char* strobj,int y);
 void* decompress(void* cdata_in, int out_size);
 //---
-void expandfish(void);
+uint8_t *gettempbuffer(void);	//Returns current graph buffer for temp use. This buffer is assumed to be 76800 bytes large.
+void allocplayerfish(size_t size);
+void freeplayerfish(void);
+void fillfishtank(void);	//Init leftfish and rightfish tables.
+void emptyfishtank(void);	//Deallocates buffer for this.
 void setplayerfish(uint8_t size);
 void initplayerstate(void);
 
@@ -122,20 +162,18 @@ void initplayerstate(void);
 int debugvalue;
 uint8_t gamemode;
 uint8_t maintimer;
-int8_t menuoption;
-
-ti_var_t slot;
 
 int score;
 int highscore;
 uint8_t playersize;
 uint8_t oldplayersize;
 bool direction;
-int movefactor;
 uint8_t fishnommed;
-int dragcoeff;
-uint8_t debugmode = 0;
+uint8_t debugmode;
 
+
+uint8_t *fishtank;
+uint8_t *fishtankptr;
 gfx_rletsprite_t* leftfish[16];
 gfx_rletsprite_t* rightfish[16];
 gfx_rletsprite_t* playerfish;
@@ -143,83 +181,89 @@ uint8_t scaling[] = {8,12,16,20,24,28,32,40,48,56,64,80,96,102,128,160};  //128,
 //-----------------------------------Enemy fish size limit--^
 uint8_t coloffsets[] = {2,15,62,31,12,8,37,37};
 
-void main(void) {
-    int x,y,i,j,temp,subtimer;
+int main(void) {
+	uint8_t i;
 	kb_key_t k;
-	char* tmp_str;
-	void* ptr1;
-	void* ptr2;
+	const char* tmp_str;
+	ti_var_t file;
+	bool isrunning;
 	
 	/* Initialize system */
-	malloc(0);  //for linking purposes
-	gfx_Begin(gfx_8bpp);
+	gfx_Begin();
 	gfx_SetDrawBuffer();
+	memcpy(gfx_palette, game_pal, sizeof game_pal);
+	gfx_SetColor(DARK_BLUE_COLOR);
 	gfx_SetTransparentColor(TRANSPARENT_COLOR);
-	gfx_SetClipRegion(0,0,320,240);
+	drawbgempty();
+	gfx_SwapDraw();	//Show something before doing fish loading.
+	
 	/* Initialize variables */
-	expandfish();  //playerfish initialized in this routine too.
+	fillfishtank();
+	allocplayerfish(PLAYERFISH_GAMEPLAY_BUFFER_SIZE);
 	initplayerstate();
 	
-	highscore = 0;
-	ti_CloseAll();
-	slot = ti_Open(scorefilename,"r");
-	if (slot) ti_Read(&highscore,sizeof highscore, 1, slot);
-	ti_CloseAll();
+	file = ti_Open(scorefilename,"r");
+	if (file) {
+		ti_Read(&highscore,sizeof highscore, 1, file);
+		ti_Close(file);
+	} else {
+		highscore = 0;
+	}
 	
 	/* Initiate main game loop */
 	gamemode = GM_TITLE;
-	maintimer = 0;
-	menuoption = 0;
-	while (1) {
+	isrunning = true;
+	while (isrunning) {
 		kb_Scan();
+		k = kb_Data[1] | kb_Data[7];
 		switch (gamemode) {
 			case GM_TITLE:
-				k = kb_Data[1];
-				i = randInt(0,255);  //keep picking rands to cycle
-				debugmode = 0;
-				if ((k == kb_2nd)&&(kb_Data[7]==(kb_Up|kb_Left))) debugmode = 1;
-				if (k == kb_2nd) {
+				srandom(rtc_Time());	//Always a brand new game each time.
+				debugmode = (k == DBG_KEYCOMBO);
+				if (k & kb_2nd) {
 					gamemode = GM_OPENANIM;
 					maintimer = 0;
 					initplayerstate();
 					break;
 				}
-				if (k == kb_Mode) putaway();
-				if (k == kb_Del) gamemode = GM_HELP;
+				if (k & kb_Mode) {
+					isrunning = false;
+					break;
+				}
+				if (k & kb_Del) gamemode = GM_HELP;
 				
 				drawbgempty();
 				
-				gfx_SetTextFGColor(0xEF);
-				gfx_SetTextScale(5,5);
-				centerxtext(title1,5);
-				gfx_SetTextScale(2,2);
-				centerxtext(title3,105);
-				centerxtext(title3a,130);
-				centerxtext(title4,155);
-				gfx_SetTextScale(1,1);
-				gfx_SetTextXY(5,230);
-				gfx_PrintString(title5);
-				gfx_PrintInt(highscore,6);
-				gfx_SetTextXY(290,230);
-				gfx_PrintString(VERSION_INFO);
+				gfx_SetTextFGColor(TITLE_TEXT_COLOR);
+				gfx_SetTextScale(5, 5);
+				centerxtext(title1, 5);
+				gfx_SetTextScale(2, 2);
+				centerxtext(title3, 105);
+				centerxtext(title3a, 130);
+				centerxtext(title4, 155);
+				gfx_SetTextScale(1, 1);
+				gfx_SetTextXY(5, 230);
+				printtext(title5);
+				gfx_PrintInt(highscore, 6);
+				gfx_SetTextXY(290, 230);
+				printtext(VERSION_INFO);
+				drawdebug();	//Comment out when done.
 				gfx_SwapDraw();
 				
 				break;
+
 			case GM_OPENANIM:
 				//game gfx
 				drawbg();
 				doplayer();
-				gfx_SetColor(0x08);  //xlibc dark blue
-				gfx_FillRectangle(GMBOX_X,GMBOX_Y,GMBOX_W,GMBOX_H);
+				gfx_FillRectangle(GMBOX_X, GMBOX_Y, GMBOX_W, GMBOX_H);
 				gfx_SetTextFGColor(GREETINGS_DIALOG_TEXT_COLOR);
 				tmp_str = (maintimer & 0x08) ? getready : blankstr;
-				gfx_GetStringWidth(tmp_str);
-				centerxtext(tmp_str,GMBOX_Y+25);
+				centerxtext(tmp_str ,GMBOX_Y+25);
 				gfx_SwapDraw();
 				if (maintimer>64) gamemode = GM_GAMEMODE;
 				break;
 			case GM_GAMEMODE:
-				k = kb_Data[1];
 				if (k & kb_Mode) {
 					gamemode = GM_GAMEOVER;
 					break;
@@ -230,22 +274,25 @@ void main(void) {
 				doenemies();
 				gfx_SwapDraw();
 				break;
+
 			case GM_DYING:
 				gamemode = GM_GAMEOVER;
 				break;
+
 			case GM_GAMEOVER:
-				gfx_SetColor(0x08);  //xlibc dark blue
 				gfx_FillRectangle(GMBOX_X,GMBOX_Y,GMBOX_W,GMBOX_H);
-				tmp_str = gameoverdesc[randInt(0,3)];
-				if (kb_Data[1] == kb_Mode) tmp_str = gameoverquit;
-				gfx_GetStringWidth(tmp_str);
+				if (k & kb_Mode) {
+					tmp_str = gameoverquit;
+				}  else {
+					tmp_str = gameoverdesc[randInt(0,3)];
+				}
 				gfx_SetTextFGColor(GREETINGS_DIALOG_TEXT_COLOR);
-				centerxtext(tmp_str,GMBOX_Y+15);
-				centerxtext(gameovertext,GMBOX_Y+35);
+				centerxtext(tmp_str, GMBOX_Y+15);
+				centerxtext(gameovertext, GMBOX_Y+35);
 				gfx_SwapDraw();
 				waitanykey();
 				gamemode = GM_TITLE;
-				if (score>highscore) {
+				if (score > highscore) {
 					highscore = score;
 				}
 				break;
@@ -255,12 +302,8 @@ void main(void) {
 				break;
 				
 			case GM_VICTORY:
-				for (i=0;i<MAX_ENEMY_SIZE;i++) {
-					free(leftfish[i]);
-					free(rightfish[i]);
-				}
-				free(playerfish);
-				playerfish = malloc((224*168)+2);
+				emptyfishtank();
+				allocplayerfish(PLAYERFISH_VICTORY_BUFFER_SIZE);
 				for (i=scaling[MAX_PLAYER_SIZE];i<240;i+=2) {
 					setplayerfish(i);
 					curx.fp -= 128;
@@ -274,15 +317,15 @@ void main(void) {
 					doplayer();
 					gfx_SwapDraw();
 				}
-				free(playerfish);
-				gfx_FillScreen(0x08);
-				gfx_SetColor(0x08);  //xlibc dark blue
-				centerxtext(end1a,88);
-				centerxtext(end1b,108);
-				centerxtext(end1c,128);
-				centerxtext(end1d,148);
+				gfx_FillScreen(DARK_BLUE_COLOR);
+				centerxtext(end1a, 88);
+				centerxtext(end1b, 108);
+				centerxtext(end1c, 128);
+				centerxtext(end1d, 148);
 				gfx_SwapDraw();
-				expandfish();
+				allocplayerfish(PLAYERFISH_GAMEPLAY_BUFFER_SIZE);
+				fillfishtank();
+				setplayerfish(0);
 				waitanykey();
 				gamemode = GM_TITLE;
 				if (score>highscore) {
@@ -293,49 +336,51 @@ void main(void) {
 			case GM_HELP:
 				keywait();
 				drawbgempty();
-				gfx_SetTextFGColor(0xEF);
-				gfx_SetTextScale(5,5);
-				centerxtext(title1,5);
-				gfx_SetTextScale(1,1);
-				centerxtext(help1,80);
-				centerxtext(help2,100);
-				centerxtext(help3,120);
-				centerxtext(help4,140);
-				centerxtext(help5,160);
-				centerxtext(help6,180);
+				gfx_SetTextFGColor(TITLE_TEXT_COLOR);
+				gfx_SetTextScale(5, 5);
+				centerxtext(title1, 5);
+				gfx_SetTextScale(1, 1);
+				centerxtext(help1, 80);
+				centerxtext(help2, 100);
+				centerxtext(help3, 120);
+				centerxtext(help4, 140);
+				centerxtext(help5, 160);
+				centerxtext(help6, 180);
 				
-				gfx_SetTextXY(5,230);
-				gfx_PrintString(title5);
-				gfx_PrintInt(highscore,6);
-				gfx_SetTextXY(290,230);
-				gfx_PrintString(VERSION_INFO);
+				gfx_SetTextXY(5, 230);
+				printtext(title5);
+				gfx_PrintInt(highscore, 6);
+				gfx_SetTextXY(290, 230);
+				printtext(VERSION_INFO);
 				gfx_SwapDraw();
 				waitanykey();
 				gamemode = GM_TITLE;
 				break;
 				
 			default:
-				putaway();
+				isrunning = false;
 				break;
 			
 		}
 		maintimer++;
 	}
-	
-	
-
-//	for (i=0;i<32;i++) enemies[i] = emptyenemy; //NOT NEEDED ANYMORE BUT KEPT FOR REFERENCE
-//	ti_CloseAll();
-//	slot = ti_Open("LLOONDAT","r");
-//	if (slot) ti_Read(&highscore,sizeof highscore, 1, slot);
-//	ti_CloseAll();
-//	loonsub_sprite = gfx_MallocSprite(32,32);
-//	dzx7_Turbo(loonsub_compressed,loonsub_sprite);
-
+	freeplayerfish();
+	emptyfishtank();
+	gfx_End();
+	file = ti_Open(scorefilename,"w");
+	if (file) {
+		ti_Write(&highscore,sizeof highscore, 1, file);
+		ti_Close(file);
+	} else {
+		asm_ClrLCDFull();
+		os_NewLine();
+		os_PutStrFull("Could not save game data.");
+	}
 }
 
 void bufferplayersprite() {
-	kb_key_t k = kb_Data[7];
+	kb_key_t k;
+	k = kb_Data[7];
 	int t = 0;
 	if (((k & kb_Right) && !direction) || ((k & kb_Left) && direction)) {
 		direction = direction^1;
@@ -359,19 +404,20 @@ void bufferplayersprite() {
 }
 //old 6431 bytes
 //new 6084 bytes
-void movetest(int* v,int* dv,kb_key_t kbneg, kb_key_t kbpos) {
-	kb_key_t k = kb_Data[7];
+void movetest(int* v, int* dv, kb_key_t kbneg, kb_key_t kbpos) {
+	kb_key_t k;
 	int t;
 	
-	if (k&kbneg) (*dv) -= movefactor;
-	if (k&kbpos) (*dv) += movefactor;
+	k = kb_Data[7];
+	if (k & kbneg) *dv -= MOVE_FACTOR;
+	if (k & kbpos) *dv += MOVE_FACTOR;
 	t = *dv;
-	t = (t<0) ? t+dragcoeff : t-dragcoeff;
+	t = (t<0) ? t+DRAG_COEFFICIENT : t-DRAG_COEFFICIENT;
 	if ((t^(*dv))<0) t = 0;
 	if (t<-maxspeed.fp)	t = -maxspeed.fp;
 	if (t>maxspeed.fp) t = maxspeed.fp;
-	(*dv) = t;
-	(*v) += t;
+	*dv = t;
+	*v += t;
 	// First half of bounds checking. The second half is in the caller since it
 	// uses different bounds depending on which axis is being used.
 	if (*v<0) *v = *dv = 0;
@@ -379,16 +425,16 @@ void movetest(int* v,int* dv,kb_key_t kbneg, kb_key_t kbpos) {
 	
 }
 void drawbgempty() {
-	gfx_FillScreen(0x12);
+	gfx_FillScreen(BACKGROUND_COLOR);
 }
 
 void drawbg() {
-	uint8_t y,i;
-	int x;
+	//uint8_t y,i;
+	//int x;
 	drawbgempty();
-	gfx_SetTextFGColor(0xFE);
+	gfx_SetTextFGColor(SCORE_TEXT_COLOR);
 	gfx_SetTextXY(3,3);
-	gfx_PrintString("SCORE: ");
+	printtext("SCORE: ");
 	gfx_PrintInt(score,6);
 	//gfx_SetTextXY(3,13); for(i=0;i<ENEMY_TABLE_SIZE;i++) gfx_PrintChar(enemytable[i].id+'A');
 }
@@ -455,7 +501,21 @@ void doenemies() {
 			if (((pb[0]<eb[2]) && (pb[2]>eb[0]) && (pb[1]<eb[3]) && (pb[3]>eb[1])) ||
 				((pb[4]<eb[6]) && (pb[6]>eb[4]) && (pb[5]<eb[7]) && (pb[7]>eb[5]))) {
 				if (((playersize < ((e->id)-1)) || ( playersize == ((e->id)-1) && randInt(0,1)))&&!debugmode) {
-					gamemode = GM_DYING;
+					//gamemode = GM_DYING;
+
+					score += 7*(e->id);
+					e->id = 0;
+					fishnommed++;
+					if ((fishnommed>(MIN_FISH_TNL+(playersize*FISH_LEVEL_UP_FACTOR)))&&!debugmode) {
+						playersize++;
+						if (playersize>MAX_PLAYER_SIZE) {
+							gamemode = GM_VICTORY;
+							return;
+						}
+						fishnommed = 0;
+					}
+
+
 					//dbg_sprintf(dbgout,"COLLIDED : %i\n",i);
 					//dbg_sprintf(dbgout,"PLOBJ : [%i,%i] [%i,%i] [%i,%i] [%i,%i] \n",pb[0],pb[1],pb[2],pb[3],pb[4],pb[5],pb[6],pb[7]);
 					//dbg_sprintf(dbgout,"ENOBJ : [%i,%i] [%i,%i] [%i,%i] [%i,%i] \n",eb[0],eb[1],eb[2],eb[3],eb[4],eb[5],eb[6],eb[7]);
@@ -522,14 +582,6 @@ void doenemies() {
 
 //---------------------------------------------------------------------------
 
-void putaway() {
-//	int_Reset();
-	gfx_End();
-	slot = ti_Open(scorefilename,"w");
-	ti_Write(&highscore,sizeof highscore, 1, slot);
-	ti_CloseAll();
-	exit(0);
-}
 
 void waitanykey() {
 	keywait();            //wait until all keys are released
@@ -542,65 +594,134 @@ void keywait() {
 }
 
 void drawdebug() {
-	static int i=0;
-	i++;
-	gfx_SetTextFGColor(0xFE);
+	//static int i=0;
+	//i++;
+	gfx_SetTextFGColor(SCORE_TEXT_COLOR);
 	gfx_SetTextXY(10,15);
-	gfx_PrintInt(debugvalue,4);
+	gfx_PrintInt(debugvalue,6);
 }
 
-void centerxtext(char* strobj,int y) {
-	gfx_PrintStringXY(strobj,(LCD_WIDTH-gfx_GetStringWidth(strobj))/2,y);
+void printtext(const char* strobj) {
+	gfx_PrintString((char*)strobj);
+}
+
+void centerxtext(const char* strobj,int y) {
+	gfx_PrintStringXY((char*)strobj,(LCD_WIDTH-gfx_GetStringWidth((char*)strobj))/2,y);
 }
 
 void* decompress(void *cdata_in,int out_size) {
 	void *ptr = malloc(out_size);
-	dzx7_Turbo(cdata_in,ptr);
+	zx0_Decompress(ptr,cdata_in);
 	return ptr;
 }
 
 //----------------------------------------------------------------------------------
 
-void expandfish(void) {
-	gfx_sprite_t* baseimg;
-	gfx_sprite_t* expaimg;
-	gfx_sprite_t* flipimg;
-	uint8_t i;
-
-	baseimg = (void*) gfx_vbuffer;
-	expaimg = (void*) (*gfx_vbuffer+fish_size);
-	flipimg = (void*) (*gfx_vbuffer+fish_size+32768+2);
-	
-	dzx7_Turbo(fish_compressed,baseimg);
-	
-	for(i=0;i<MAX_ENEMY_SIZE;i++) {
-		expaimg->width = (scaling[i]*fish_width)/64;
-		expaimg->height = (scaling[i]*fish_height)/64;
-		
-		gfx_ScaleSprite(baseimg,expaimg);
-		gfx_FlipSpriteY(expaimg,flipimg);
-		leftfish[i] = gfx_ConvertMallocRLETSprite(expaimg);
-		rightfish[i] = gfx_ConvertMallocRLETSprite(flipimg);
-	}
-	playerfish = malloc((160*120)+2);  //fish_width*3*fish_height*3+2
+uint8_t *gettempbuffer(void) {
+	return (uint8_t*) gfx_vbuffer;
 }
 
 
+void allocplayerfish(size_t size) {
+	freeplayerfish();
+	playerfish = malloc(size);
+	assert(playerfish);
+}
 
+
+void freeplayerfish(void) {
+	free(playerfish);
+	playerfish = NULL;
+}
+
+
+void *addtofishtank(size_t size) {
+	void *ptr;
+	ptr = fishtankptr;
+	fishtankptr += size;
+	if ((fishtankptr-fishtank)>FISHTANK_SIZE) {
+		sprintf((char*)0xFC0000,"Fishtank overflow! Used %i bytes.",fishtankptr-fishtank);
+		gfx_End();
+		exit(1);
+	}
+	return ptr;
+}
+
+//The fish tank is a large area of memory used to store the decompressed and
+//expanded fish sprites. Fill it when the game starts. Empty it when it ends.
+void fillfishtank(void) {
+	uint8_t *tempbuffer;
+	gfx_sprite_t* baseimg;	//Sprite object. Initial size.
+	gfx_sprite_t* expaimg;	//Expaneded (or shrunk) version of sprite object
+	gfx_sprite_t* flipimg;	//Expanded sprite, but flipped across Y axis.
+	uint8_t i;
+
+	emptyfishtank();
+	fishtank = malloc(FISHTANK_SIZE);
+	assert(fishtank);
+	fishtankptr = fishtank;
+
+	tempbuffer = gettempbuffer();
+	baseimg = (void*) tempbuffer;
+	expaimg = (void*) (tempbuffer+fish_size);
+	flipimg	= (void*) (tempbuffer+fish_size+((LCD_WIDTH*LCD_HEIGHT)/2)+2);
+
+	zx0_Decompress(baseimg,fish_compressed);
+
+	for (i=0; i<MAX_ENEMY_SIZE; ++i) {
+		//Scale fish by setting destination size parameters first.
+		expaimg->width = (scaling[i]*fish_width)/64;
+		expaimg->height = (scaling[i]*fish_height)/64;
+		//Scale base sprite then flip it.
+		gfx_ScaleSprite(baseimg,expaimg);
+		gfx_FlipSpriteY(expaimg,flipimg);
+		leftfish[i] = gfx_ConvertToNewRLETSprite(expaimg, addtofishtank);
+		rightfish[i] = gfx_ConvertToNewRLETSprite(flipimg, addtofishtank);
+	}
+	sprintf((char*)0xFB0000,"Fishtank used %i bytes.",fishtankptr-fishtank);
+}
+
+void emptyfishtank(void) {
+	free(fishtank);
+	fishtank = NULL;
+	fishtankptr = NULL;
+	memset(leftfish, 0, sizeof leftfish);
+	memset(rightfish, 0, sizeof rightfish);
+	//NOTE: Please refrain from using the fish tables (leftfish/rightfish)
+	//after this function is called. No checks are made to ensure they aren't.
+	//Also, the player sprite is not stored in the fish tank, so it is unaffected
+	//by this function.
+	//NOTE: Or do try to use them if you want to know what use-after-free feels like. I won't stop you.
+}
+
+//TODO: Figure out how all these calls are being used and see if any changes
+//need to be made to the way the player sprite is stored. The main concern
+//at the moment is how I've changed how and where I've used malloc for everything.
+//Keep in mind that if you win the game, a lot of freeing is done around that
+//time to make room for the giant player sprite used in the victory animation. 
+//So be sure to test that if you change anything in this area.
+
+
+/*  During gameplay, set size to 0 in order to use the current player size.
+	The size parameter is only really used in a nonzero capacity to freely
+	resize the player sprite during victory animation.
+*/
 void setplayerfish(uint8_t size) {
+	uint8_t *tempbuffer;
 	gfx_sprite_t* baseimg;
 	gfx_sprite_t* expaimg;
 	gfx_sprite_t* flipimg;
-	uint8_t i;
 
-	baseimg = (void*) gfx_vbuffer;
-	expaimg = (void*) (*gfx_vbuffer+fish_size);
-	flipimg = (void*) (*gfx_vbuffer+fish_size+32768+2);
+	assert(playerfish);
+	tempbuffer = gettempbuffer();
+	baseimg = (void*) tempbuffer;
+	expaimg = (void*) (tempbuffer+fish_size);
+	flipimg = (void*) (tempbuffer+fish_size+((LCD_WIDTH*LCD_HEIGHT)/2)+2);
 	
 	if (debugmode) {
-		dzx7_Turbo(devblock_compressed,expaimg);
+		zx0_Decompress(expaimg,devblock_compressed);
 	} else {
-		dzx7_Turbo(player_compressed,baseimg);
+		zx0_Decompress(baseimg,player_compressed);
 		if (!size) {
 			expaimg->width = (scaling[playersize]*fish_width)>>6;
 			expaimg->height = (scaling[playersize]*fish_height)>>6;
@@ -611,9 +732,6 @@ void setplayerfish(uint8_t size) {
 		}
 		gfx_ScaleSprite(baseimg,expaimg);
 	}
-	/* WARNING: THE CONVERSION ASSUMES THERE IS ENOUGH TRANSPARENCY IN THE
-	   IMAGE TO OVERCOME THE OVERHEAD OF THE RLET SPRITE FORMAT. DO NOT USE
-	   IMAGES THAT ARE TOO LARGE OR TOO NOISY */
 	if (direction) {
 		gfx_FlipSpriteY(expaimg,flipimg);
 		gfx_ConvertToRLETSprite(flipimg,playerfish);
@@ -621,6 +739,7 @@ void setplayerfish(uint8_t size) {
 		gfx_ConvertToRLETSprite(expaimg,playerfish);
 	}
 }
+
 
 void initplayerstate(void) {
 	oldplayersize = playersize = 1;
@@ -630,8 +749,6 @@ void initplayerstate(void) {
 	fishnommed = 0;
 	curx.p.ipart = (LCD_WIDTH+8)/2;
 	cury.p.ipart = (LCD_HEIGHT+6)/2;
-	movefactor = 14;
-	dragcoeff = 6;
 	maxspeed.fp = 2*256;
 	setplayerfish(0);
 	memset(&emptyenemy,0,sizeof emptyenemy);

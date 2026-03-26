@@ -1,0 +1,33 @@
+palettes:
+  - name: game_pal
+    fixed-entries:
+      - color: {index: 0, hex: "#FF00DC"}   #Pink. For transparency.
+      - color: {index: 1, hex: "#BDF7FF"}   #Light cyan
+      - color: {index: 2, hex: "#100042"}   #Dark purple
+      - color: {index: 3, hex: "#DEFF7B"}   #Light yellow
+      - color: {index: 4, hex: "#FFBD7F"}   #Light orange
+      - color: {index: 5, hex: "#218494"}   #Teal
+    quality: 10
+    images: automatic
+
+converts:
+  - name: game_img
+    palette: game_pal
+    compress: zx0
+    images:
+      - devblock.png
+      - fish.png
+      - player.png
+    style: palette    #If supporting rlet sprites, use 'rlet' instead of 'palette'
+    #transparent-index: 0   #Defaults to 0.
+
+outputs:
+  - type: c
+    palettes:
+      - game_pal
+    converts:
+      - game_img
+    include-file: sprites_gfx.h
+    prepend-palette-sizes: true
+    const: true
+

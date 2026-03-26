@@ -66,7 +66,7 @@ Troubleshooting
 
 License
 -------
-I use the BSD license for this project. See `LICENSE` for more details.
+I use the MIT license for this project. See `LICENSE` for more details.
 
 Version History
 ---------------
@@ -74,6 +74,7 @@ Version History
 * 0.2 - I don't know what I did wrong but the provided executable didn't
         want to work right. It does if you recompile with the included
 		source so I took this as an excuse to upload what I had to GitHub.
+* 0.3 - Changed license from BSD to MIT. 
 		
 ________________________________________________________________________________
 
