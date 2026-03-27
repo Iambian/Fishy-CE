@@ -8,7 +8,7 @@
 NAME        = FISHY
 ICON        = icon.png
 DESCRIPTION = "Fishy"
-COMPRESSED  = NO
+COMPRESSED  = YES
 COMPRESSED_MODE = zx0
 HAS_PRINTF  = NO
 ARCHIVED    = NO

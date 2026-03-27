@@ -29,10 +29,9 @@
 #endif
 
 
-#define LCD_WIDTH 320
-#define LCD_HEIGHT 240
+#define LCD_WIDTH GFX_LCD_WIDTH
+#define LCD_HEIGHT GFX_LCD_HEIGHT
 
-#define BULLET_TABLE_SIZE 512
 #define ENEMY_TABLE_SIZE 32
 #define MAX_ENEMY_SIZE 13
 #define MAX_PLAYER_SIZE 15
@@ -48,7 +47,6 @@
 #define GM_TITLE 0
 #define GM_OPENANIM 1
 #define GM_GAMEMODE 2
-#define GM_CLOSINGANIM 3
 #define GM_DYING 4
 #define GM_GAMEOVER 5
 #define GM_OUTPOSTSHOP 6
@@ -70,17 +68,12 @@
 #include <tice.h>
 
 /* Standard headers (recommended) */
-#include <math.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/rtc.h>
-#include <assert.h>
 
 
 /* External library headers */
-#include <debug.h>
-#include <intce.h>
 #include <keypadc.h>
 #include <graphx.h>
 #include <compression.h>
@@ -90,23 +83,43 @@
 
 #define DBG_KEYCOMBO (kb_2nd | kb_Left | kb_Right)
 
-typedef union fp16_8 {
-	int fp;
-	struct {
-		uint8_t fpart;
-		int16_t ipart;
-	} p;
-} fp16_8;
-fp16_8 curx,cury,dx,dy,maxspeed,gravity,thrust;
+typedef int fixed_t;
+
+#define FIXED_SHIFT 8
+
+//The check below is for determining if shifting uses arithmetic right shifts.
+//If it does (as is the case on the ez80), then we have a cheaper path to do
+//these operations.
+#if ((-1 >> 1) == -1)
+	#define FIXED_INT_PART_USES_SHIFT 1
+	#define FIXED_ONE (1 << FIXED_SHIFT)
+	//NOTE: fixed_from_int was split but it turns out that LLVM actually optimizes
+	//this so the split is unneeded. I'm just too lazy to revert it back at this point.
+	#define fixed_from_int(value) ((value) << FIXED_SHIFT)
+	#define fixed_int_part(value) ((value) >> FIXED_SHIFT)
+#else
+	#define FIXED_ONE (1 << FIXED_SHIFT)
+	#define FIXED_INT_PART_USES_SHIFT 0
+	static inline fixed_t fixed_from_int(int value) {
+		return value * FIXED_ONE;
+	}
+	static inline int fixed_int_part(fixed_t value) {
+		if (value >= 0) {
+			return value / FIXED_ONE;
+		}
+		return -(((-value) + (FIXED_ONE - 1)) / FIXED_ONE);
+	}
+#endif
+
+fixed_t curx,cury,dx,dy,maxspeed;
 
 typedef struct enemy_t {
 	uint8_t id;
-	fp16_8 x;
-	fp16_8 y;
-	fp16_8 dx;
-	int temp;
+	fixed_t x;
+	fixed_t y;
+	fixed_t dx;
 } enemy_t;
-enemy_t emptyenemy,testenemy,enemytable[ENEMY_TABLE_SIZE];
+enemy_t enemytable[ENEMY_TABLE_SIZE];
 
 
 
@@ -116,28 +129,39 @@ const char *gameovertext = "Game Over";
 const char *getready = "Get ready to nom!";
 const char *blankstr = "";
 const char *title1 = "FISHY";
-const char *title3 = "[2nd] = Start game";
-const char *title3a = "[DEL] = Show help";
-const char *title4 = "[MODE] = Quit game";
 const char *title5 = "High score: ";
-const char *end1a = "You ate so many fish";
-const char *end1b = "that you destroyed";
-const char *end1c = "the lake ecosystem.";
-const char *end1d = "Nice job breaking everything.";
 
-const char *help1 = "Eat smaller fish to grow";
-const char *help2 = "Don't get eaten by bigger fish";
-const char *help3 = "Larger fish are worth more points";
-const char *help4 = "This game is loosely based of the flash";
-const char *help5 = "game \"!Fishy!\" from XGenStudios.com";
-const char *help6 = "Press any key to go back to the main menu";
+const char *titleblock[] = {
+	"[2nd] = Start game",
+	"[DEL] = Show help",
+	"[MODE] = Quit game",
+	NULL
+};
+
+const char *endblock[] = {
+	"You ate so many fish",
+	"that you destroyed",
+	"the lake ecosystem.",
+	"Nice job breaking everything.",
+	NULL
+};
+
+const char *helpblock[] = {
+	"Eat smaller fish to grow",
+	"Don't get eaten by bigger fish",
+	"Larger fish are worth more points",
+	"This game is loosely based on the flash",
+	"game \"!Fishy!\" from XGenStudios.com",
+	"Press any key to go back to the main menu",
+	NULL
+};
 
 const char *scorefilename = "FISHYDAT";
 
 /* Put your function prototypes here */
 
 void bufferplayersprite();
-void movetest(int* v,int* dv,kb_key_t kbneg, kb_key_t kbpos);
+void movetest(fixed_t* v,fixed_t* dv,kb_key_t kbneg, kb_key_t kbpos);
 void drawbg();
 void drawbgempty();
 void doplayer();
@@ -148,7 +172,10 @@ void keywait();
 void drawdebug();
 void printtext(const char* strobj);
 void centerxtext(const char* strobj,int y);
-void* decompress(void* cdata_in, int out_size);
+void centeredblock(const char *strsobj[], int startheight, int lineheight);
+void fatalerror(const char* message);
+bool consumeenemy(enemy_t* e, bool stop_after_eat);
+void updatehighscore(void);
 //---
 uint8_t *gettempbuffer(void);	//Returns current graph buffer for temp use. This buffer is assumed to be 76800 bytes large.
 void allocplayerfish(size_t size);
@@ -238,16 +265,14 @@ int main(void) {
 				gfx_SetTextScale(5, 5);
 				centerxtext(title1, 5);
 				gfx_SetTextScale(2, 2);
-				centerxtext(title3, 105);
-				centerxtext(title3a, 130);
-				centerxtext(title4, 155);
+				centeredblock(titleblock, 105, 25);
 				gfx_SetTextScale(1, 1);
 				gfx_SetTextXY(5, 230);
 				printtext(title5);
 				gfx_PrintInt(highscore, 6);
 				gfx_SetTextXY(290, 230);
 				printtext(VERSION_INFO);
-				drawdebug();	//Comment out when done.
+				//drawdebug();	//Comment out when done.
 				gfx_SwapDraw();
 				
 				break;
@@ -292,13 +317,7 @@ int main(void) {
 				gfx_SwapDraw();
 				waitanykey();
 				gamemode = GM_TITLE;
-				if (score > highscore) {
-					highscore = score;
-				}
-				break;
-			case GM_CLOSINGANIM:
-				//This game doesn't actually close. So... yeah. Start
-				//replacing these endgame events pronto.
+				updatehighscore();
 				break;
 				
 			case GM_VICTORY:
@@ -306,8 +325,8 @@ int main(void) {
 				allocplayerfish(PLAYERFISH_VICTORY_BUFFER_SIZE);
 				for (i=scaling[MAX_PLAYER_SIZE];i<240;i+=2) {
 					setplayerfish(i);
-					curx.fp -= 128;
-					cury.fp -= 128;
+					curx -= 128;
+					cury -= 128;
 					drawbg();
 					doplayer();
 					gfx_SwapDraw();
@@ -318,19 +337,15 @@ int main(void) {
 					gfx_SwapDraw();
 				}
 				gfx_FillScreen(DARK_BLUE_COLOR);
-				centerxtext(end1a, 88);
-				centerxtext(end1b, 108);
-				centerxtext(end1c, 128);
-				centerxtext(end1d, 148);
+
+				centeredblock(endblock, 88, 20);
 				gfx_SwapDraw();
 				allocplayerfish(PLAYERFISH_GAMEPLAY_BUFFER_SIZE);
 				fillfishtank();
 				setplayerfish(0);
 				waitanykey();
 				gamemode = GM_TITLE;
-				if (score>highscore) {
-					highscore = score;
-				}
+				updatehighscore();
 				break;
 				
 			case GM_HELP:
@@ -340,13 +355,7 @@ int main(void) {
 				gfx_SetTextScale(5, 5);
 				centerxtext(title1, 5);
 				gfx_SetTextScale(1, 1);
-				centerxtext(help1, 80);
-				centerxtext(help2, 100);
-				centerxtext(help3, 120);
-				centerxtext(help4, 140);
-				centerxtext(help5, 160);
-				centerxtext(help6, 180);
-				
+				centeredblock(helpblock, 80, 20);
 				gfx_SetTextXY(5, 230);
 				printtext(title5);
 				gfx_PrintInt(highscore, 6);
@@ -392,19 +401,25 @@ void bufferplayersprite() {
 	}
 
 	//Accelerate if moving in direction, else decelerate (less)
-	movetest((int*) &curx.fp,(int*) &dx.fp,kb_Left,kb_Right);
+	movetest(&curx,&dx,kb_Left,kb_Right);
 	t = LCD_WIDTH-((scaling[playersize]*fish_width)>>6);
-	if (curx.p.ipart>t) { curx.p.ipart = t;	dx.fp = 0; }
+	if (fixed_int_part(curx)>t) {
+		curx = fixed_from_int(t);
+		dx = 0;
+	}
 	
-	movetest((int*) &cury.fp,(int*) &dy.fp,kb_Up,kb_Down);
+	movetest(&cury,&dy,kb_Up,kb_Down);
 	t = LCD_HEIGHT-((scaling[playersize]*fish_height)>>6);
-	if (cury.p.ipart>t) { cury.p.ipart = t; dy.fp = 0; }
+	if (fixed_int_part(cury)>t) {
+		cury = fixed_from_int(t);
+		dy = 0;
+	}
 	
 	return;
 }
 //old 6431 bytes
 //new 6084 bytes
-void movetest(int* v, int* dv, kb_key_t kbneg, kb_key_t kbpos) {
+void movetest(fixed_t* v, fixed_t* dv, kb_key_t kbneg, kb_key_t kbpos) {
 	kb_key_t k;
 	int t;
 	
@@ -414,8 +429,8 @@ void movetest(int* v, int* dv, kb_key_t kbneg, kb_key_t kbpos) {
 	t = *dv;
 	t = (t<0) ? t+DRAG_COEFFICIENT : t-DRAG_COEFFICIENT;
 	if ((t^(*dv))<0) t = 0;
-	if (t<-maxspeed.fp)	t = -maxspeed.fp;
-	if (t>maxspeed.fp) t = maxspeed.fp;
+	if (t<-maxspeed)	t = -maxspeed;
+	if (t>maxspeed) t = maxspeed;
 	*dv = t;
 	*v += t;
 	// First half of bounds checking. The second half is in the caller since it
@@ -440,7 +455,7 @@ void drawbg() {
 }
 
 void doplayer() {
-	gfx_RLETSprite(playerfish,curx.p.ipart,cury.p.ipart);
+	gfx_RLETSprite(playerfish,fixed_int_part(curx),fixed_int_part(cury));
 	return;
 }
 
@@ -462,18 +477,18 @@ void doenemies() {
 	for(i=0;i<ENEMY_TABLE_SIZE;i++) {
 		e = &enemytable[i];
 		if (e->id) {
-			if ((e->dx.fp)>0) {
+			if (e->dx>0) {
 				ptr = rightfish[(e->id)-1];
 			} else {
 				ptr = leftfish[(e->id)-1];
 			}
-			gfx_RLETSprite(ptr,e->x.p.ipart,e->y.p.ipart);
+			gfx_RLETSprite(ptr,fixed_int_part(e->x),fixed_int_part(e->y));
 		}
 	}
 	//Collide with enemies and perform object thingies.
 	scale = (int) scaling[playersize];
-	x = curx.p.ipart;
-	y = cury.p.ipart;
+	x = fixed_int_part(curx);
+	y = fixed_int_part(cury);
 	if (debugmode) {
 		for(i=0;i<8;i+=4) {
 			pb[i+0] = x+0;
@@ -492,46 +507,16 @@ void doenemies() {
 		e = &enemytable[i];
 		if (e->id) {
 			scale = (int) scaling[(e->id)-1];
-			x = e->x.p.ipart;
-			y = e->y.p.ipart;
+			x = fixed_int_part(e->x);
+			y = fixed_int_part(e->y);
 			for(j=0;j<8;j+=2) {
 				eb[j+0] = x+((((int)coloffsets[j+0])*scale)>>6);
 				eb[j+1] = y+((((int)coloffsets[j+1])*scale)>>6);
 			}
 			if (((pb[0]<eb[2]) && (pb[2]>eb[0]) && (pb[1]<eb[3]) && (pb[3]>eb[1])) ||
 				((pb[4]<eb[6]) && (pb[6]>eb[4]) && (pb[5]<eb[7]) && (pb[7]>eb[5]))) {
-				if (((playersize < ((e->id)-1)) || ( playersize == ((e->id)-1) && randInt(0,1)))&&!debugmode) {
-					//gamemode = GM_DYING;
-
-					score += 7*(e->id);
-					e->id = 0;
-					fishnommed++;
-					if ((fishnommed>(MIN_FISH_TNL+(playersize*FISH_LEVEL_UP_FACTOR)))&&!debugmode) {
-						playersize++;
-						if (playersize>MAX_PLAYER_SIZE) {
-							gamemode = GM_VICTORY;
-							return;
-						}
-						fishnommed = 0;
-					}
-
-
-					//dbg_sprintf(dbgout,"COLLIDED : %i\n",i);
-					//dbg_sprintf(dbgout,"PLOBJ : [%i,%i] [%i,%i] [%i,%i] [%i,%i] \n",pb[0],pb[1],pb[2],pb[3],pb[4],pb[5],pb[6],pb[7]);
-					//dbg_sprintf(dbgout,"ENOBJ : [%i,%i] [%i,%i] [%i,%i] [%i,%i] \n",eb[0],eb[1],eb[2],eb[3],eb[4],eb[5],eb[6],eb[7]);
+				if (consumeenemy(e, ((playersize < ((e->id)-1)) || (playersize == ((e->id)-1) && randInt(0,1))) && !debugmode)) {
 					return;
-				} else {
-					score += 7*(e->id);
-					e->id = 0;
-					fishnommed++;
-					if ((fishnommed>(MIN_FISH_TNL+(playersize*FISH_LEVEL_UP_FACTOR)))&&!debugmode) {
-						playersize++;
-						if (playersize>MAX_PLAYER_SIZE) {
-							gamemode = GM_VICTORY;
-							return;
-						}
-						fishnommed = 0;
-					}
 				}
 			
 			}
@@ -555,10 +540,9 @@ void doenemies() {
 					dx = -spd;
 				}
 				e->id = id+1;
-				e->x.fp = x<<8;
-				e->y.fp = randInt(0,239-((scaling[id]*fish_height)>>6))<<8;
-				e->dx.fp = dx;
-				e->temp = 0;
+				e->x = fixed_from_int(x);
+				e->y = fixed_from_int(randInt(0,239-((scaling[id]*fish_height)>>6)));
+				e->dx = dx;
 				break;
 			}
 		}
@@ -568,8 +552,8 @@ void doenemies() {
 	for (i=0;i<ENEMY_TABLE_SIZE;i++) {
 		e = &enemytable[i];
 		if (e->id) {
-			e->x.fp += e->dx.fp;
-			x = e->x.p.ipart;
+			e->x += e->dx;
+			x = fixed_int_part(e->x);
 			w = (scaling[(e->id)-1]*fish_width)>>6;
 			if ((x<(-w)) || (x>(LCD_WIDTH+w))) {
 				e->id = 0;
@@ -605,14 +589,55 @@ void printtext(const char* strobj) {
 	gfx_PrintString((char*)strobj);
 }
 
+void centeredblock(const char *strsobj[], int startheight, int lineheight) {
+	uint8_t i;
+	for (i=0; strsobj[i]; ++i) {
+		centerxtext(strsobj[i], startheight);
+		startheight += lineheight;
+	}
+}
+
+
+
 void centerxtext(const char* strobj,int y) {
 	gfx_PrintStringXY((char*)strobj,(LCD_WIDTH-gfx_GetStringWidth((char*)strobj))/2,y);
 }
 
-void* decompress(void *cdata_in,int out_size) {
-	void *ptr = malloc(out_size);
-	zx0_Decompress(ptr,cdata_in);
-	return ptr;
+void fatalerror(const char* message) {
+	gfx_End();
+	asm_ClrLCDFull();
+	os_NewLine();
+	os_PutStrFull((char*)message);
+	while (true) {
+	}
+}
+
+bool consumeenemy(enemy_t* e, bool stop_after_eat) {
+	if (stop_after_eat) {
+		//If the player is smaller than the enemy, or if they are the same size
+		//but the random number says the enemy wins, then the player dies.
+		gamemode = GM_DYING;
+		return true;
+	}
+	score += 7 * e->id;
+	e->id = 0;
+	++fishnommed;
+	if ((fishnommed > (MIN_FISH_TNL + (playersize * FISH_LEVEL_UP_FACTOR))) && !debugmode) {
+		++playersize;
+		if (playersize > MAX_PLAYER_SIZE) {
+			gamemode = GM_VICTORY;
+			return true;
+		}
+		fishnommed = 0;
+	}
+
+	return stop_after_eat;
+}
+
+void updatehighscore(void) {
+	if (score > highscore) {
+		highscore = score;
+	}
 }
 
 //----------------------------------------------------------------------------------
@@ -624,8 +649,7 @@ uint8_t *gettempbuffer(void) {
 
 void allocplayerfish(size_t size) {
 	freeplayerfish();
-	playerfish = malloc(size);
-	assert(playerfish);
+	playerfish = malloc(size);	//We have bigger problems if this fails.
 }
 
 
@@ -639,6 +663,11 @@ void *addtofishtank(size_t size) {
 	void *ptr;
 	ptr = fishtankptr;
 	fishtankptr += size;
+	/* Do not remove the stuff below in case the user changes what the fish
+	   looks like since this affects conversion to RLETSprite. If you *must*
+	   recover the space this takes, comment it out for future use. Doing this
+	   programmatically would consume even more space so we don't do that.
+	*/
 	if ((fishtankptr-fishtank)>FISHTANK_SIZE) {
 		sprintf((char*)0xFC0000,"Fishtank overflow! Used %i bytes.",fishtankptr-fishtank);
 		gfx_End();
@@ -652,13 +681,13 @@ void *addtofishtank(size_t size) {
 void fillfishtank(void) {
 	uint8_t *tempbuffer;
 	gfx_sprite_t* baseimg;	//Sprite object. Initial size.
-	gfx_sprite_t* expaimg;	//Expaneded (or shrunk) version of sprite object
+	gfx_sprite_t* expaimg;	//Expanded (or shrunk) version of sprite object
 	gfx_sprite_t* flipimg;	//Expanded sprite, but flipped across Y axis.
 	uint8_t i;
 
 	emptyfishtank();
 	fishtank = malloc(FISHTANK_SIZE);
-	assert(fishtank);
+
 	fishtankptr = fishtank;
 
 	tempbuffer = gettempbuffer();
@@ -678,7 +707,6 @@ void fillfishtank(void) {
 		leftfish[i] = gfx_ConvertToNewRLETSprite(expaimg, addtofishtank);
 		rightfish[i] = gfx_ConvertToNewRLETSprite(flipimg, addtofishtank);
 	}
-	sprintf((char*)0xFB0000,"Fishtank used %i bytes.",fishtankptr-fishtank);
 }
 
 void emptyfishtank(void) {
@@ -687,20 +715,7 @@ void emptyfishtank(void) {
 	fishtankptr = NULL;
 	memset(leftfish, 0, sizeof leftfish);
 	memset(rightfish, 0, sizeof rightfish);
-	//NOTE: Please refrain from using the fish tables (leftfish/rightfish)
-	//after this function is called. No checks are made to ensure they aren't.
-	//Also, the player sprite is not stored in the fish tank, so it is unaffected
-	//by this function.
-	//NOTE: Or do try to use them if you want to know what use-after-free feels like. I won't stop you.
 }
-
-//TODO: Figure out how all these calls are being used and see if any changes
-//need to be made to the way the player sprite is stored. The main concern
-//at the moment is how I've changed how and where I've used malloc for everything.
-//Keep in mind that if you win the game, a lot of freeing is done around that
-//time to make room for the giant player sprite used in the victory animation. 
-//So be sure to test that if you change anything in this area.
-
 
 /*  During gameplay, set size to 0 in order to use the current player size.
 	The size parameter is only really used in a nonzero capacity to freely
@@ -708,51 +723,49 @@ void emptyfishtank(void) {
 */
 void setplayerfish(uint8_t size) {
 	uint8_t *tempbuffer;
-	gfx_sprite_t* baseimg;
-	gfx_sprite_t* expaimg;
-	gfx_sprite_t* flipimg;
+	gfx_sprite_t *initial_sprite;
+	gfx_sprite_t *expanded_sprite;	//Also used as scratch space for flipping.
 
-	assert(playerfish);
 	tempbuffer = gettempbuffer();
-	baseimg = (void*) tempbuffer;
-	expaimg = (void*) (tempbuffer+fish_size);
-	flipimg = (void*) (tempbuffer+fish_size+((LCD_WIDTH*LCD_HEIGHT)/2)+2);
-	
+	initial_sprite = (void*) tempbuffer;
+	expanded_sprite = (void*) (tempbuffer+fish_size);
+
 	if (debugmode) {
-		zx0_Decompress(expaimg,devblock_compressed);
+		zx0_Decompress(initial_sprite, devblock_compressed);
+		expanded_sprite->width = initial_sprite->width;
+		expanded_sprite->height = initial_sprite->height;
 	} else {
-		zx0_Decompress(baseimg,player_compressed);
+		zx0_Decompress(initial_sprite, player_compressed);
+		if (direction) {
+			gfx_FlipSpriteY(initial_sprite, expanded_sprite);
+			memcpy(initial_sprite, expanded_sprite, fish_size);	//Flip back since the scaling function modifies the source sprite.
+		}
+		//Set scaling size based on player size or victory animation size.
 		if (!size) {
-			expaimg->width = (scaling[playersize]*fish_width)>>6;
-			expaimg->height = (scaling[playersize]*fish_height)>>6;
+			expanded_sprite->width = (scaling[playersize]*fish_width)>>6;
+			expanded_sprite->height = (scaling[playersize]*fish_height)>>6;
 		} else {
 			direction = 0;
-			expaimg->width = (size*fish_width)>>6;
-			expaimg->height = (size*fish_height)>>6;
+			expanded_sprite->width = (size*fish_width)>>6;
+			expanded_sprite->height = (size*fish_height)>>6;
 		}
-		gfx_ScaleSprite(baseimg,expaimg);
 	}
-	if (direction) {
-		gfx_FlipSpriteY(expaimg,flipimg);
-		gfx_ConvertToRLETSprite(flipimg,playerfish);
-	} else {
-		gfx_ConvertToRLETSprite(expaimg,playerfish);
-	}
+	gfx_ScaleSprite(initial_sprite, expanded_sprite);
+	gfx_ConvertToRLETSprite(expanded_sprite, playerfish);
 }
 
 
 void initplayerstate(void) {
 	oldplayersize = playersize = 1;
-	dx.fp = dy.fp = 0;
+	dx = dy = 0;
 	direction = 0;
 	score = 0;
 	fishnommed = 0;
-	curx.p.ipart = (LCD_WIDTH+8)/2;
-	cury.p.ipart = (LCD_HEIGHT+6)/2;
-	maxspeed.fp = 2*256;
+	curx = fixed_from_int((LCD_WIDTH+8)/2);
+	cury = fixed_from_int((LCD_HEIGHT+6)/2);
+	maxspeed = fixed_from_int(2);
 	setplayerfish(0);
-	memset(&emptyenemy,0,sizeof emptyenemy);
-	memset(enemytable,0,ENEMY_TABLE_SIZE*sizeof(emptyenemy));
+	memset(enemytable,0,sizeof enemytable);
 
 }
 
