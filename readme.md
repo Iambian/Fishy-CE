@@ -73,8 +73,9 @@ Version History
 * 0.1 - Initial release to Cemetech
 * 0.2 - I don't know what I did wrong but the provided executable didn't
         want to work right. It does if you recompile with the included
-		source so I took this as an excuse to upload what I had to GitHub.
-* 0.3 - Changed license from BSD to MIT. 
+        source so I took this as an excuse to upload what I had to GitHub.
+* 0.3 - Changed license from BSD to MIT. Optimized things. Then un-optimized
+        them prior to hiding it via on-compile compression.
 		
 ________________________________________________________________________________
 
@@ -87,11 +88,14 @@ Building the Game from Source
 * Get the source for Fishy here:
   https://github.com/Iambian/Fishy-CE
   
-* Compile the graphics. Navigate to `src/gfx`, then type `convpng` in the
-  Explorer window's address bar or run it from that folder in a console window.
+* Compile the graphics. In the project's root folder (where `makefile` is),
+  type `make gfx` into a console or the explorer's address bar.
   
-* Build the project. Navigate to the project's root folder (where makefile is)
-  and type `make` in the Explorer window's address bar, or type that in a
-  console window open to that folder.
+* Build the project.  In the project's root folder (where `makefile` is),
+  first compile the graphics if you haven't done so already, then type `make`
+  into a console or the explorer's address bar.
+
+* If there were any problems or doing `make gfx` or `make` did not do what you
+  expected it to, try doing `make clean` and retrying the other things.
   
 * If the build is successful, the result should be in the `bin` folder.
